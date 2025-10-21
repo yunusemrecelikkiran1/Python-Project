@@ -9,37 +9,61 @@ import sys
 import time
 import unicodedata
 import requests
+import io
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus, urlparse, unquote, parse_qs
 
 ISTINYE_URL = "https://aday.istinye.edu.tr/taban-puan-ve-ucretler"
 ATLAS_URL   = "https://tercih.atlas.edu.tr/ogrenim-ucretleri"
 
-# '₺485.925' / '450.000 TL' -> 485925
-TL_RE = re.compile(r"(?:₺\s*([\d\.\,]+)|([\d\.\,]+)\s*(?:TL\b))", re.IGNORECASE)
-# Atlas sayfasında satır içindeki tüm TL'leri sırayla almak için:
-MONEY_IN_LINE_RE = re.compile(r"(\d[\d\.\,]*)\s*(?:TL|₺)?", re.IGNORECASE)
+# Yeni: Arel PDF kaynağı
+AREL_PDF_URL = "https://yataygecis.arel.edu.tr/wp-content/uploads/2025/07/istanbul-arel-universitesi-yatay-gecis-ucretleri-2025-2026.pdf"
+
+
+# Eski:
+# TL_RE = re.compile(r"(?:₺\s*([\d\.\,]+)|([\d\.\,]+)\s*(?:TL\b))", re.IGNORECASE)
+# MONEY_IN_LINE_RE = re.compile(r"(\d[\d\.\,]*)\s*(?:TL|₺)?", re.IGNORECASE)
+
+# Yeni: daha sağlam TL/birim yakalayıcıları
+# Açıklama: binlik ayraçları nokta, boşluk veya NBSP olabilir; ondalık kısım virgülle gelebilir.
+TL_RE = re.compile(
+    r"(?:₺\s*)?([0-9]{1,3}(?:[.\s\u00A0][0-9]{3})*(?:,[0-9]+)?)\s*(?:TL\b)?",
+    re.IGNORECASE
+)
+MONEY_IN_LINE_RE = re.compile(
+    r"(?:₺\s*)?([0-9]{1,3}(?:[.\s\u00A0][0-9]{3})*(?:,[0-9]+)?)\s*(?:TL\b)?",
+    re.IGNORECASE
+)
+
 
 def parse_money(cell_text: str):
     """
-    '₺485.925' / '450.000 TL' -> 485925 (int)
+    '₺485.925' / '450.000 TL' / '450 000,50 TL' -> 485925 / 450000 (int)
     Bulamazsa None döner.
+    Mantık: binlik ayraçlarını (. veya boşluk veya NBSP) temizle, varsa ondalık kısmı at.
     """
     if not cell_text:
         return None
-    s = cell_text.replace("\xa0", " ")
+    s = str(cell_text).replace("\u00A0", " ").strip()
+    # önce TL_RE ile yakala, yoksa daha gevşek bir sayı yakala
     m = TL_RE.search(s)
     if m:
-        raw = m.group(1) or m.group(2)
+        raw = m.group(1)
     else:
-        # fallback: satırda herhangi bir sayı dizisi al
-        m2 = re.search(r"([\d\.\,]{2,})", s)
+        m2 = re.search(r"([0-9][0-9\.\s\u00A0,]*)", s)
         if not m2:
             return None
         raw = m2.group(1)
-    raw = raw.replace(".", "").replace(",", "")
+
+    # Temizleme: NBSP/boşluk/nokta binlik ayraçlarını kaldır, ondalık kısmı at
+    cleaned = raw.replace("\u00A0", "").replace(" ", "").replace(".", "")
+    if "," in cleaned:
+        cleaned = cleaned.split(",", 1)[0]
+    cleaned = re.sub(r"[^\d]", "", cleaned)
+    if not cleaned:
+        return None
     try:
-        return int(raw)
+        return int(cleaned)
     except Exception:
         return None
 
@@ -200,9 +224,6 @@ def scrape_generic(url, university_name, default_year="2025"):
             data.extend(rows)
     return data
 
-def scrape_istinye():
-    return scrape_generic(ISTINYE_URL, "İstinye Üniversitesi", default_year="2025")
-
 # -------- Atlas'a özel: tablo yerine akış (metin) üzerinden çekim --------
 
 def iter_content_nodes(soup):
@@ -257,29 +278,85 @@ def extract_atlas_stream(soup):
 
     return rows
 
-def scrape_atlas():
-    r = requests.get(ATLAS_URL, headers={"User-Agent": "uni-fee-bot/1.0"}, timeout=30)
-    r.raise_for_status()
-    time.sleep(1)
-    soup = BeautifulSoup(r.text, "html.parser")
+# Yeni yardımcı: PDF bytelarından metin çek (PyPDF2 varsa kullan)
+def extract_text_from_pdf_bytes(data: bytes) -> str:
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        pages = []
+        for p in reader.pages:
+            t = p.extract_text() or ""
+            pages.append(t)
+        return "\n".join(pages)
+    except Exception:
+        # Basit fallback: metni herhangi bir text decode ile al (PDF içeriği okunamazsa boş döner)
+        try:
+            return data.decode("utf-8", errors="replace")
+        except Exception:
+            try:
+                return data.decode("latin-1", errors="replace")
+            except Exception:
+                return ""
 
-    # 1) İhtimalen yok ama yine de: tabloları dener
-    table_rows = []
-    for table in soup.find_all("table"):
-        faculty = nearest_faculty_title(table)
-        table_rows.extend(
-            extract_table_rows(table, faculty, "Atlas Üniversitesi", ATLAS_URL, default_year="2025")
-        )
+# Yeni: Arel (PDF) için scraping
+def scrape_arel():
+    """
+    İstanbul Arel Üniversitesi ücret listesi (PDF) kaynağından basit metin tarama ile TL satırlarını çıkarır.
+    Çok sağlam bir PDF parsing değil; PyPDF2 varsa daha iyi sonuç verir.
+    """
+    rows = []
+    try:
+        r = requests.get(AREL_PDF_URL, headers={"User-Agent": "uni-fee-bot/1.0"}, timeout=30)
+        r.raise_for_status()
+        time.sleep(1)
+        text = extract_text_from_pdf_bytes(r.content)
+    except Exception as e:
+        print(f"[arel] PDF indirilemedi veya okunamadı: {e}")
+        return rows
 
-    # 2) Asıl yöntem: akıştan çek
-    stream_rows = extract_atlas_stream(soup)
+    # Satırlara ayır ve TL içeren satırları ara
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    # Basit heuristic: TL içeren satır program ismi + tutar içerebilir; değilse önceki satır program olabilir.
+    for i, ln in enumerate(lines):
+        if (" TL" in ln.upper()) or ("₺" in ln):
+            # Satırdaki tüm eşleşmeleri tek seferde tarayıp değerleri topla
+            money_vals = []
+            for m in MONEY_IN_LINE_RE.finditer(ln):
+                val = parse_money(m.group(0))
+                if val is not None:
+                    money_vals.append(val)
+            if not money_vals:
+                continue
 
-    data = []
-    if table_rows:
-        data.extend(table_rows)
-    if stream_rows:
-        data.extend(stream_rows)
-    return data
+            # Program adı tahmini: aynı satırda TL'den önce kalan metin ya da önceki satır
+            # Para ifadelerini kaldırarak program adını temizle
+            prog_candidate = MONEY_IN_LINE_RE.sub("", ln).strip(" -–:,.")
+            if not prog_candidate:
+                # önceki anlamlı satırı dene
+                j = i - 1
+                while j >= 0 and not lines[j].strip():
+                    j -= 1
+                if j >= 0:
+                    prog_candidate = lines[j]
+            # yine boşsa atla
+            if not prog_candidate:
+                continue
+
+            # Peşin / burslu heuristiği: ilk iki para değeri sırayla al
+            pesin_val = money_vals[0] if money_vals else None
+            burslu_val = money_vals[1] if len(money_vals) > 1 else None
+
+            rows.append({
+                "university": "İstanbul Arel Üniversitesi",
+                "faculty": "",  # PDF'den kolay ayrıştırılamıyor; boş bırak
+                "program": prog_candidate,
+                "year": "2025",
+                "fee_pesin_try": pesin_val,
+                "fee_bilincli_burslu_try": burslu_val,
+                "source": AREL_PDF_URL
+            })
+
+    return rows
 
 # ---------------- Yardımcılar: kayıtları kaydet / arama / yazdırma ----------------
 
@@ -567,32 +644,82 @@ def search_university_url(name, max_results=12):
         print(f"[fallback] Özel ücret sayfası bulunamadı, ilk sonuç döndürülüyor: {first}")
     return first
 
-def scrape_by_university_choice(choice: str):
-    c = normalize_text(choice)
-    # Bilinen üniversiteler
-    if "istinye" in c:
-        return scrape_istinye()
-    if "atlas" in c:
-        return scrape_atlas()
-    # Eğer tam URL verilmişse
-    if choice.startswith("http://") or choice.startswith("https://"):
-        uni_name = re.sub(r"https?://(www\.)?", "", choice).split("/")[0]
-        return scrape_generic(choice, uni_name, default_year="2025")
+# --- Düzeltilmiş: tek ve tutarlı dispatcher fonksiyonu ---
 
-    # Yeni: isim girilmişse web araması yap ve uygun URL'den çek
-    print(f"'{choice}' için web araması (otomatik '{choice} ücretleri') yapılıyor...")
-    found = search_university_url(choice)
-    if found:
-        print(f"Bulunan ücret sayfası: {found}")
-        uni_name = choice
+def scrape_by_university_choice(choice: str, default_year: str = "2025"):
+    """
+    Basit dispatcher:
+    - 'istinye' -> ISTINYE_URL üzerinden scrape_generic
+    - 'atlas'   -> ATLAS_URL üzerinden önce tablolar sonra extract_atlas_stream
+    - 'arel'    -> AREL_PDF_URL üzerinden scrape_arel
+    - URL verilmişse -> scrape_generic
+    - aksi halde -> search_university_url ile bulunup scrape_generic
+    """
+    c = normalize_text(choice or "")
+
+    # Direkt URL verilmişse
+    if isinstance(choice, str) and (choice.startswith("http://") or choice.startswith("https://")):
+        uni_name = re.sub(r"https?://(www\.)?", "", choice).split("/")[0]
         try:
-            return scrape_generic(found, uni_name, default_year="2025")
+            return scrape_generic(choice, uni_name, default_year=default_year)
         except Exception as e:
-            print(f"Sayfadan veri çekme hatası: {e}")
+            print(f"[error] URL'den veri çekilemedi: {e}")
             return []
-    else:
-        print("Uygun ücret sayfası bulunamadı. Lütfen doğrudan üniversitenin ücret sayfası URL'sini girin (ör. https://...)")
-        return []
+
+    # Bilinen anahtarlar
+    if "istinye" in c:
+        return scrape_generic(ISTINYE_URL, "İstinye Üniversitesi", default_year=default_year)
+
+    if "arel" in c or "istanbul arel" in c or "arel üniversitesi" in c:
+        try:
+            return scrape_arel()
+        except Exception as e:
+            print(f"[arel] Hata: {e}")
+            return []
+
+    if "atlas" in c:
+        url = ATLAS_URL
+        try:
+            r = requests.get(url, headers={"User-Agent": "uni-fee-bot/1.0"}, timeout=30)
+            r.raise_for_status()
+            time.sleep(1)
+            soup = BeautifulSoup(r.text, "html.parser")
+        except Exception as e:
+            print(f"[atlas] Sayfa indirilemedi: {e}")
+            return []
+
+        data = []
+        # Tablo bazlı dene
+        for table in soup.find_all("table"):
+            faculty = nearest_faculty_title(table)
+            rows = extract_table_rows(table, faculty, "Atlas Üniversitesi", url, default_year=default_year)
+            if rows:
+                data.extend(rows)
+        # Akış bazlı dene
+        try:
+            stream_rows = extract_atlas_stream(soup)
+            if stream_rows:
+                data.extend(stream_rows)
+        except Exception as e:
+            print(f"[atlas] Akıştan çekme sırasında hata: {e}")
+        return data
+
+        found = search_university_url(source)
+        if found:
+            print(f"Bulunan ücret sayfası: {found}")
+            uni_name = source
+            try:
+                return scrape_generic(found, uni_name, default_year=default_year)
+            except Exception as e:
+                print(f"Sayfadan veri çekme hatası: {e}")
+                return []
+        else:
+            print("Uygun ücret sayfası bulunamadı.")
+            return []
+
+    # fallback boş liste
+    return []
+
 
 if __name__ == "__main__":
     all_rows = []
@@ -636,4 +763,3 @@ if __name__ == "__main__":
         else:
             print("\nÖrnek ilk 10 kayıt:")
             print_results(all_rows[:10])
-print ("kodu değiştirdim deniyorum")
