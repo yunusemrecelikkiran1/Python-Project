@@ -636,3 +636,4 @@ if __name__ == "__main__":
         else:
             print("\nÖrnek ilk 10 kayıt:")
             print_results(all_rows[:10])
+print ("kodu değiştirdim deniyorum")
